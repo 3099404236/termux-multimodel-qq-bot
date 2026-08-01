@@ -111,6 +111,8 @@ typst compile paper/main.typ paper/main.pdf --root .
 ## 发布信息
 
 - GitHub：<https://github.com/3099404236/termux-multimodel-qq-bot>
+- 项目主页：<https://3099404236.github.io/publications/termux-multimodel-qq-bot.html>
+- 在线 PDF：<https://3099404236.github.io/papers/termux-multimodel-qq-bot-v0.1.0.pdf>
 - 版本：`v0.1.0`
 - 快照日期：2026-08-01
 - 分类：应用系统
