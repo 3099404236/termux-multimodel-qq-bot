@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AstrBot Stack Control
+Comment=Open the AstrBot start/stop control page
+Exec=/bin/bash -lc 'cd /home/czf/dasanxia/astrbot && ./scripts/open_stack_control.sh'
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;Network;
+StartupNotify=true

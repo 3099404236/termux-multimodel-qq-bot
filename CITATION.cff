@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+type: software
+title: "基于 Termux 的多模型 QQ 群聊机器人系统"
+authors:
+  - family-names: "3099404236"
+date-released: "2026-08-01"
+version: "0.1.0"
+license: "AGPL-3.0-only"
+repository-code: "https://github.com/3099404236/termux-multimodel-qq-bot"
+url: "https://github.com/3099404236/termux-multimodel-qq-bot"
+abstract: >-
+  A complete Android/Termux QQ group bot stack integrating NapCat, AstrBot,
+  persistent Antigravity terminal sessions, a ChatGPT web bridge, group memory,
+  explicit model routing, monitoring and privacy-conscious deployment.

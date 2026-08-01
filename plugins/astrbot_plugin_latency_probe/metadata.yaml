@@ -1,0 +1,4 @@
+name: astrbot_plugin_latency_probe
+desc: Record queue, model, decoration, sending, and total reply latency.
+version: v1.0.0
+author: Codex
