@@ -4,7 +4,7 @@
 
 本仓库以 2026-08-01 从 Redmi 生产手机只读导出的代码为准。公开版本已经移除 QQ 号、Cookie、OAuth 状态、API Key、聊天数据库、日志、二维码、浏览器 Profile、模型会话记录和运行缓存；手机上的生产代码没有因为本次发布而被修改或重启。
 
-PDF 项目报告：[paper/main.pdf](paper/main.pdf)
+PDF 项目报告：[paper/main.pdf](paper/main.pdf)。v0.2.0 报告基于脱敏后的 WorkBuddy 工程记录，补充九类真实故障、性能测量、超时链和恢复设计；原始会话与隐私数据不进入公开仓库。
 
 ## 系统结构
 
@@ -112,7 +112,7 @@ typst compile paper/main.typ paper/main.pdf --root .
 
 - GitHub：<https://github.com/3099404236/termux-multimodel-qq-bot>
 - 项目主页：<https://3099404236.github.io/publications/termux-multimodel-qq-bot.html>
-- 在线 PDF：<https://3099404236.github.io/papers/termux-multimodel-qq-bot-v0.1.0.pdf>
-- 版本：`v0.1.0`
+- 在线 PDF：<https://3099404236.github.io/papers/termux-multimodel-qq-bot-v0.2.0.pdf>
+- 版本：`v0.2.0`
 - 快照日期：2026-08-01
 - 分类：应用系统

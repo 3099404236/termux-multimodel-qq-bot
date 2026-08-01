@@ -5,7 +5,7 @@ title: "基于 Termux 的多模型 QQ 群聊机器人系统"
 authors:
   - family-names: "3099404236"
 date-released: "2026-08-01"
-version: "0.1.0"
+version: "0.2.0"
 license: "AGPL-3.0-only"
 repository-code: "https://github.com/3099404236/termux-multimodel-qq-bot"
 url: "https://github.com/3099404236/termux-multimodel-qq-bot"

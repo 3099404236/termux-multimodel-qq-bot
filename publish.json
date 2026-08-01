@@ -10,8 +10,8 @@
   "summary": "在 Redmi Android 手机上串联 NapCat、AstrBot、Antigravity 与 ChatGPT 网页桥的长期运行 QQ 群聊机器人。",
   "abstract": "该项目把 QQ 接入、群聊记忆、OpenAI 兼容路由、持久化交互式终端、显式模型选择、Exa 搜索授权、ChatGPT 网页会话、图片回传、长回复整理、延迟观测和进程守护组合成一套可在 Termux/proot Ubuntu 中运行的完整系统。公开版本源自 2026-08-01 的生产手机只读快照，并移除了账号、Cookie、API Key、聊天记录、数据库、日志和浏览器 Profile。",
   "version": {
-    "label": "v0.1.0",
-    "note": "首个公开、脱敏且带 PDF 报告的完整手机端快照。",
+    "label": "v0.2.0",
+    "note": "扩展工程报告：补充 WorkBuddy 故障时间线、九类真实事故、量化性能对比、超时链、监控与恢复设计。",
     "demo": ""
   }
 }
