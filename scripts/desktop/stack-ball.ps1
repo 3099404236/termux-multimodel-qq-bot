@@ -55,6 +55,7 @@ $Script:Tip = "$($Script:BotTip)`r`n`r`n$($Script:BackupTip)"
 $Script:Busy = $false
 $Script:BackupConfigFile = Join-Path $env:LOCALAPPDATA "stack-ball-sources.json"
 $Script:BackupConfig = $null
+$Script:ActiveBackupSource = $null
 
 # A widget with no window has nowhere to report from. One line per poll makes
 # "why is it grey" answerable without attaching a debugger to it.
@@ -86,63 +87,89 @@ function Read-BackupConfig {
     }
 }
 
-function Read-BackupStatus {
-    Read-BackupConfig
-    if (-not $Script:BackupConfig) {
-        $Script:BackupState = "unknown"
-        $Script:BackupTip = "私有备份：未配置"
-        return
+function Get-BackupSources {
+    if (-not $Script:BackupConfig) { return @() }
+    if ($Script:BackupConfig.backup_sources) { return @($Script:BackupConfig.backup_sources) }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Script:BackupConfig.backup_status_file)) {
+        return @(,[pscustomobject]@{
+            id = "legacy"
+            display_name = [string]$Script:BackupConfig.backup_display_name
+            status_file = [string]$Script:BackupConfig.backup_status_file
+            panel_url = [string]$Script:BackupConfig.backup_panel_url
+            task_name = [string]$Script:BackupConfig.backup_task_name
+            interval_hours = [int]$Script:BackupConfig.interval_hours
+        })
     }
+    return @()
+}
 
-    $statusFile = [string]$Script:BackupConfig.backup_status_file
+function Get-OneBackupSummary {
+    param([Parameter(Mandatory = $true)]$Source)
+    $displayName = [string]$Source.display_name
+    if ([string]::IsNullOrWhiteSpace($displayName)) { $displayName = "私有备份" }
+    $statusFile = [string]$Source.status_file
     if ([string]::IsNullOrWhiteSpace($statusFile) -or -not (Test-Path -LiteralPath $statusFile)) {
-        $Script:BackupState = "unknown"
-        $Script:BackupTip = "私有备份：尚无运行记录"
-        return
+        return [pscustomobject]@{ State = "unknown"; Tip = "$displayName：尚无运行记录"; Source = $Source }
     }
 
     try {
         $backup = Get-Content -LiteralPath $statusFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        $state = [string]$backup.state
-        switch ($state) {
+        $backupState = "unknown"
+        switch ([string]$backup.state) {
             "success" {
-                $Script:BackupState = "ok"
+                $backupState = "ok"
                 $lastSuccess = [string]$backup.last_success_at
-                $intervalHours = [Math]::Max(1, [int]$Script:BackupConfig.interval_hours)
+                $intervalHours = [Math]::Max(1, [int]$Source.interval_hours)
                 if (-not [string]::IsNullOrWhiteSpace($lastSuccess)) {
                     try {
                         $ageHours = ([DateTimeOffset]::Now - [DateTimeOffset]::Parse($lastSuccess)).TotalHours
-                        if ($ageHours -gt ($intervalHours * 2 + 1)) { $Script:BackupState = "stale" }
+                        if ($ageHours -gt ($intervalHours * 2 + 1)) { $backupState = "stale" }
                     } catch { }
                 }
+                if ($backup.storage_warning) { $backupState = "stale" }
             }
-            "failed"  { $Script:BackupState = "down" }
-            "running" { $Script:BackupState = "running" }
-            default   { $Script:BackupState = "unknown" }
+            "failed"  { $backupState = "down" }
+            "running" { $backupState = "running" }
         }
-
-        $stateLabel = switch ($Script:BackupState) {
+        $stateLabel = switch ($backupState) {
             "ok"      { "成功" }
-            "stale"   { "成功记录已过期" }
+            "stale"   { if ($backup.storage_warning) { "成功，但有容量预警" } else { "成功记录已过期" } }
             "down"    { "失败" }
             "running" { "正在执行" }
             default   { "未知" }
         }
-        $lines = @("私有备份：$stateLabel")
-        if ($backup.outcome -eq "no_changes") { $lines += "· 项目无变化，远端已确认" }
+        $lines = @("$displayName：$stateLabel")
+        if ($backup.outcome -eq "no_changes") { $lines += "· 项目无变化，未新增版本" }
         elseif ($backup.outcome -eq "pushed") { $lines += "· 已推送新快照" }
         if ($backup.last_success_at) {
             try { $lines += "· 上次成功 $([DateTimeOffset]::Parse([string]$backup.last_success_at).ToLocalTime().ToString('MM-dd HH:mm:ss'))" }
             catch { $lines += "· 上次成功 $($backup.last_success_at)" }
         }
         if ($backup.commit) { $lines += "· 快照 $(([string]$backup.commit).Substring(0, [Math]::Min(12, ([string]$backup.commit).Length)))" }
+        if ($backup.storage_warning) { $lines += "! $(([string]$backup.storage_warning).Substring(0, [Math]::Min(180, ([string]$backup.storage_warning).Length)))" }
         if ($backup.error) { $lines += "✗ $(([string]$backup.error).Substring(0, [Math]::Min(180, ([string]$backup.error).Length)))" }
-        $Script:BackupTip = $lines -join "`r`n"
+        return [pscustomobject]@{ State = $backupState; Tip = ($lines -join "`r`n"); Source = $Source }
     } catch {
-        $Script:BackupState = "unknown"
-        $Script:BackupTip = "私有备份：状态文件无法读取"
-        Write-Log "读取备份状态失败: $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+        Write-Log "读取备份状态失败 $statusFile : $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+        return [pscustomobject]@{ State = "unknown"; Tip = "$displayName：状态文件无法读取"; Source = $Source }
     }
+}
+
+function Read-BackupStatus {
+    Read-BackupConfig
+    $sources = @(Get-BackupSources)
+    if ($sources.Count -eq 0) {
+        $Script:BackupState = "unknown"
+        $Script:BackupTip = "私有备份：未配置"
+        $Script:ActiveBackupSource = $null
+        return
+    }
+    $summaries = @($sources | ForEach-Object { Get-OneBackupSummary -Source $_ })
+    $priority = @{ down = 50; running = 40; stale = 30; unknown = 20; ok = 10 }
+    $active = $summaries | Sort-Object @{ Expression = { $priority[[string]$_.State] }; Descending = $true } | Select-Object -First 1
+    $Script:BackupState = [string]$active.State
+    $Script:ActiveBackupSource = $active.Source
+    $Script:BackupTip = (@($summaries | ForEach-Object { $_.Tip }) -join "`r`n`r`n")
 }
 
 Read-BackupConfig
@@ -403,14 +430,19 @@ function New-BallBitmap {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    # Draw each half independently so one compact ball can carry two sources.
+    # Draw one unified ball when both sources agree; split only when their states differ.
     $pad = 3
     $rect = New-Object System.Drawing.Rectangle($pad, $pad, ($s - 1 - 2 * $pad), ($s - 1 - 2 * $pad))
     $halfWidth = [int][Math]::Ceiling($s / 2.0)
-    $halves = @(
-        @{ Color = $Color; Clip = (New-Object System.Drawing.Rectangle(0, 0, $halfWidth, $s)) },
-        @{ Color = $SecondaryColor; Clip = (New-Object System.Drawing.Rectangle([int]($s / 2), 0, $halfWidth, $s)) }
-    )
+    $isSplit = $Color.ToArgb() -ne $SecondaryColor.ToArgb()
+    $halves = if ($isSplit) {
+        @(
+            @{ Color = $Color; Clip = (New-Object System.Drawing.Rectangle(0, 0, $halfWidth, $s)) },
+            @{ Color = $SecondaryColor; Clip = (New-Object System.Drawing.Rectangle([int]($s / 2), 0, $halfWidth, $s)) }
+        )
+    } else {
+        @(,@{ Color = $Color; Clip = (New-Object System.Drawing.Rectangle(0, 0, $s, $s)) })
+    }
     foreach ($half in $halves) {
         $saved = $g.Save()
         $g.SetClip($half.Clip)
@@ -441,9 +473,11 @@ function New-BallBitmap {
     $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(90, 0, 0, 0), 1)
     $g.DrawEllipse($pen, $rect)
     $pen.Dispose()
-    $divider = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(85, 0, 0, 0), 1)
-    $g.DrawLine($divider, [int]($s / 2), ($pad + 2), [int]($s / 2), ($s - $pad - 3))
-    $divider.Dispose()
+    if ($isSplit) {
+        $divider = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(85, 0, 0, 0), 1)
+        $g.DrawLine($divider, [int]($s / 2), ($pad + 2), [int]($s / 2), ($s - $pad - 3))
+        $divider.Dispose()
+    }
 
     $g.Dispose()
     return $bitmap
@@ -644,9 +678,9 @@ $Script:Moved = $false
 # no console has nowhere to report that. Derive the page from whichever
 # address is actually answering instead.
 function Get-PanelUrl {
-    Read-BackupConfig
-    if ($Script:BackupConfig -and -not [string]::IsNullOrWhiteSpace([string]$Script:BackupConfig.backup_panel_url)) {
-        return [string]$Script:BackupConfig.backup_panel_url
+    Read-BackupStatus
+    if ($Script:ActiveBackupSource -and -not [string]::IsNullOrWhiteSpace([string]$Script:ActiveBackupSource.panel_url)) {
+        return [string]$Script:ActiveBackupSource.panel_url
     }
     $panelHost = $Script:LastGood
     if ($Script:Status -ne "unknown" -and $Script:CurrentUrl) {
@@ -666,8 +700,8 @@ function Open-Panel {
 }
 
 function Start-ConfiguredBackup {
-    Read-BackupConfig
-    $taskName = if ($Script:BackupConfig) { [string]$Script:BackupConfig.backup_task_name } else { "" }
+    Read-BackupStatus
+    $taskName = if ($Script:ActiveBackupSource) { [string]$Script:ActiveBackupSource.task_name } else { "" }
     if ([string]::IsNullOrWhiteSpace($taskName)) {
         Write-Log "立即备份跳过：没有配置计划任务"
         return
