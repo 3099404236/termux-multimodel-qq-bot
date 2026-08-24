@@ -15,6 +15,9 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -36,6 +39,14 @@ _DEFAULT_GPT_MODEL = "chatgpt-web"
 _CHATGPT_WEB_ENDPOINT = os.environ.get(
     "CHATGPT_WEB_ENDPOINT", "http://127.0.0.1:8766/v1/chat/completions"
 )
+_MANAGER_SYSTEM_POLICY = """This request is routed through Antigravity Manager.
+Follow the supplied conversation and tool definitions. Do not use a web-search
+capability unless the latest user message explicitly asks to search, browse,
+look something up, or verify it online. Do not call an Exa tool unless the
+latest user message explicitly asks to use Exa. Merely mentioning a tool,
+asking not to use it, or deciding that it would help is not permission.
+Never claim that a tool or search succeeded unless its current-turn result was
+actually returned to you."""
 
 _BACKGROUND_SESSION_PREFIXES = ("group-memory-compressor:",)
 _GPT_NEGATIVE_PATTERN = re.compile(
@@ -131,6 +142,10 @@ class BridgeConfig:
     persistent_submit_timeout_seconds: float
     persistent_progress_timeout_seconds: float
     persistent_buffer_screens: int
+    manager_base_url: str | None = None
+    manager_api_key: str | None = None
+    manager_model: str | None = None
+    manager_timeout_seconds: float = 300
 
 
 @dataclass
@@ -317,6 +332,164 @@ async def _chatgpt_web_completion(
         )
         return BridgeAssistantResult(content=content, tool_calls=tuple(tool_calls))
     return BridgeAssistantResult(content=content or "")
+
+
+def _manager_chat_completions_url(base_url: str) -> str:
+    raw_url = base_url.strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise BridgeExecutionError(
+            "Antigravity Manager Base URL must be an absolute HTTP(S) URL.",
+            status_code=500,
+            code="antigravity_manager_url_invalid",
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise BridgeExecutionError(
+            "Antigravity Manager Base URL cannot contain credentials, a query, or a fragment.",
+            status_code=500,
+            code="antigravity_manager_url_invalid",
+        )
+    if parsed.path.rstrip("/").endswith("/v1/chat/completions"):
+        return raw_url
+    if parsed.path.rstrip("/").endswith("/v1"):
+        return f"{raw_url}/chat/completions"
+    return f"{raw_url}/v1/chat/completions"
+
+
+def _manager_error_detail(raw_body: bytes) -> str | None:
+    text = raw_body.decode("utf-8", errors="replace").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text[:500]
+    if not isinstance(payload, dict):
+        return text[:500]
+    error = payload.get("error")
+    if isinstance(error, dict):
+        detail = error.get("message") or error.get("code")
+    else:
+        detail = error or payload.get("message")
+    return str(detail)[:500] if detail else None
+
+
+def _manager_message_content(value: Any) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        text_parts = [
+            str(part.get("text"))
+            for part in value
+            if isinstance(part, dict)
+            and part.get("type") in {"text", "output_text"}
+            and part.get("text") is not None
+        ]
+        if text_parts:
+            return "\n".join(text_parts)
+    return json.dumps(value, ensure_ascii=False)
+
+
+async def _antigravity_manager_completion(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any,
+    model: str,
+    config: BridgeConfig,
+) -> BridgeAssistantResult:
+    if not config.manager_base_url or not config.manager_api_key:
+        raise BridgeExecutionError(
+            "Antigravity Manager backend is missing its Base URL or API Key.",
+            status_code=500,
+            code="antigravity_manager_config_missing",
+        )
+
+    endpoint = _manager_chat_completions_url(config.manager_base_url)
+    manager_messages = [
+        {"role": "system", "content": _MANAGER_SYSTEM_POLICY},
+        *messages,
+    ]
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": manager_messages,
+        "stream": False,
+    }
+    if tools:
+        payload["tools"] = tools
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.manager_api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    def _post() -> dict[str, Any]:
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=config.manager_timeout_seconds,
+            ) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = _manager_error_detail(exc.read())
+            message = f"Antigravity Manager returned HTTP {exc.code}."
+            if detail:
+                message = f"{message} {detail}"
+            raise BridgeExecutionError(
+                message,
+                status_code=502,
+                code="antigravity_manager_http_error",
+            ) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise BridgeExecutionError(
+                f"Could not reach Antigravity Manager: {reason}",
+                status_code=502,
+                code="antigravity_manager_unreachable",
+            ) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise BridgeExecutionError(
+                "Antigravity Manager returned an invalid JSON response.",
+                status_code=502,
+                code="antigravity_manager_response_invalid",
+            ) from exc
+
+    LOGGER.info(
+        "Routing completion to Antigravity Manager. endpoint=%s model=%s",
+        endpoint,
+        model,
+    )
+    response_payload = await asyncio.to_thread(_post)
+    try:
+        message = response_payload["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise BridgeExecutionError(
+            "Antigravity Manager response did not contain an assistant message.",
+            status_code=502,
+            code="antigravity_manager_response_invalid",
+        ) from exc
+    if not isinstance(message, dict):
+        raise BridgeExecutionError(
+            "Antigravity Manager returned an invalid assistant message.",
+            status_code=502,
+            code="antigravity_manager_response_invalid",
+        )
+    raw_tool_calls = message.get("tool_calls") or []
+    tool_calls = tuple(item for item in raw_tool_calls if isinstance(item, dict))
+    content = _manager_message_content(message.get("content"))
+    if content is None and not tool_calls:
+        raise BridgeExecutionError(
+            "Antigravity Manager returned an empty assistant message.",
+            status_code=502,
+            code="antigravity_manager_response_invalid",
+        )
+    return BridgeAssistantResult(content=content, tool_calls=tool_calls)
 
 
 def _model_scoped_session_key(session_key: str | None, route: str) -> str | None:
@@ -1782,6 +1955,29 @@ async def run_antigravity_prompt(
     )
     if model_route == "gpt":
         return await _chatgpt_web_completion(prompt_messages)
+    if config.manager_base_url:
+        manager_model = (
+            agy_model if model_route == "opus" else config.manager_model or agy_model
+        )
+        if not manager_model:
+            raise BridgeExecutionError(
+                "Antigravity Manager backend requires a real model ID.",
+                status_code=500,
+                code="antigravity_manager_model_missing",
+            )
+        LOGGER.info(
+            "Selected Antigravity Manager route. session=%s route=%s model=%s",
+            session_key,
+            model_route,
+            manager_model,
+        )
+        return await _antigravity_manager_completion(
+            prompt_messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            model=manager_model,
+            config=config,
+        )
     routed_session_key = _model_scoped_session_key(session_key, model_route)
     session = _reusable_session(config, routed_session_key)
     LOGGER.info(
@@ -1940,7 +2136,9 @@ def create_app(config: BridgeConfig) -> Quart:
     app = create_openai_compatible_app(
         config,
         bridge_name="antigravity-openai-bridge",
-        backend_name="Antigravity CLI",
+        backend_name=(
+            "Antigravity Manager" if config.manager_base_url else "Antigravity CLI"
+        ),
         model_owner="antigravity-bridge",
         prompt_builder=build_antigravity_prompt,
         prompt_runner=run_antigravity_prompt,
@@ -1959,7 +2157,8 @@ def create_app(config: BridgeConfig) -> Quart:
 def parse_args(argv: list[str] | None = None) -> BridgeConfig:
     parser = argparse.ArgumentParser(
         description=(
-            "Expose a local OpenAI-compatible chat endpoint backed by Antigravity CLI."
+            "Expose a local OpenAI-compatible endpoint backed by Antigravity "
+            "Manager or the legacy Antigravity CLI."
         )
     )
     parser.add_argument(
@@ -2009,6 +2208,31 @@ def parse_args(argv: list[str] | None = None) -> BridgeConfig:
         choices=["low", "medium", "high"],
         default=os.environ.get("ANTIGRAVITY_BRIDGE_EFFORT") or None,
         help="Optional reasoning effort passed to `agy --effort`.",
+    )
+    parser.add_argument(
+        "--manager-base-url",
+        default=os.environ.get("ANTIGRAVITY_MANAGER_BASE_URL") or None,
+        help=(
+            "Optional Antigravity Manager base URL. When set, Manager HTTP replaces "
+            "the legacy agy CLI backend. The value may end at the host, /v1, or "
+            "/v1/chat/completions."
+        ),
+    )
+    parser.add_argument(
+        "--manager-api-key",
+        default=os.environ.get("ANTIGRAVITY_MANAGER_API_KEY") or None,
+        help="API Key used to authenticate to Antigravity Manager.",
+    )
+    parser.add_argument(
+        "--manager-model",
+        default=os.environ.get("ANTIGRAVITY_MANAGER_MODEL") or None,
+        help="Real Manager model ID used by the default Antigravity route.",
+    )
+    parser.add_argument(
+        "--manager-timeout",
+        default=float(os.environ.get("ANTIGRAVITY_MANAGER_TIMEOUT", "300")),
+        type=float,
+        help="Maximum wait time for one Antigravity Manager HTTP request.",
     )
     parser.add_argument(
         "--workdir",
@@ -2146,6 +2370,10 @@ def parse_args(argv: list[str] | None = None) -> BridgeConfig:
     )
 
     args = parser.parse_args(argv)
+    if args.manager_base_url and not args.manager_api_key:
+        parser.error("--manager-api-key is required with --manager-base-url")
+    if args.manager_base_url and not args.manager_model:
+        parser.error("--manager-model is required with --manager-base-url")
     advertised_models = tuple(
         dict.fromkeys([args.model, *[model for model in args.advertise_model if model]])
     )
@@ -2188,6 +2416,10 @@ def parse_args(argv: list[str] | None = None) -> BridgeConfig:
             1,
         ),
         persistent_buffer_screens=max(args.persistent_buffer_screens, 8),
+        manager_base_url=args.manager_base_url,
+        manager_api_key=args.manager_api_key,
+        manager_model=args.manager_model,
+        manager_timeout_seconds=max(args.manager_timeout, 1),
     )
 
 
@@ -2199,10 +2431,11 @@ def main(argv: list[str] | None = None) -> None:
     config = parse_args(argv)
     app = create_app(config)
     LOGGER.info(
-        "Starting Antigravity bridge on http://%s:%s (model=%s, workdir=%s)",
+        "Starting Antigravity bridge on http://%s:%s (model=%s, backend=%s, workdir=%s)",
         config.host,
         config.port,
         config.default_model,
+        "manager" if config.manager_base_url else "cli",
         config.workdir,
     )
     app.run(host=config.host, port=config.port)

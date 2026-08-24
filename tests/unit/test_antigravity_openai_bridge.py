@@ -1,6 +1,8 @@
 import asyncio
 import importlib.util
+import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -154,6 +156,108 @@ def test_parse_args_advertises_unique_models_and_can_disable_sandbox(tmp_path):
     assert config.advertised_models == ("antigravity", "gemini")
     assert config.workdir == tmp_path.resolve()
     assert config.sandbox is False
+
+
+def test_parse_args_enables_manager_backend(tmp_path):
+    config = parse_args(
+        [
+            "--manager-base-url",
+            "http://manager.example:8045/v1",
+            "--manager-api-key",
+            "test-secret",
+            "--manager-model",
+            "gemini-test-model",
+            "--manager-timeout",
+            "45",
+            "--workdir",
+            str(tmp_path),
+        ]
+    )
+
+    assert config.manager_base_url == "http://manager.example:8045/v1"
+    assert config.manager_api_key == "test-secret"
+    assert config.manager_model == "gemini-test-model"
+    assert config.manager_timeout_seconds == 45
+
+
+def test_manager_backend_forwards_openai_messages_and_tools(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_weather",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "weather_lookup",
+                                            "arguments": '{"city":"Shanghai"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["authorization"] = request.get_header("Authorization")
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(BRIDGE.urllib.request, "urlopen", fake_urlopen)
+    config = replace(
+        _make_config(),
+        manager_base_url="http://manager.example:8045/v1",
+        manager_api_key="test-secret",
+        manager_model="gemini-test-model",
+        manager_timeout_seconds=45,
+    )
+    messages = [{"role": "user", "content": "Check Shanghai weather."}]
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "weather_lookup", "parameters": {}},
+        }
+    ]
+
+    result = asyncio.run(
+        BRIDGE.run_antigravity_prompt(
+            prompt="unused manager prompt",
+            requested_model="antigravity",
+            config=config,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+        )
+    )
+
+    assert captured["url"] == ("http://manager.example:8045/v1/chat/completions")
+    assert captured["authorization"] == "Bearer test-secret"
+    assert captured["timeout"] == 45
+    assert captured["payload"]["model"] == "gemini-test-model"
+    assert captured["payload"]["messages"][1:] == messages
+    assert "explicitly asks to use Exa" in captured["payload"]["messages"][0]["content"]
+    assert captured["payload"]["tools"] == tools
+    assert captured["payload"]["tool_choice"] == "auto"
+    assert result.content is None
+    assert result.tool_calls[0]["function"]["name"] == "weather_lookup"
 
 
 def test_openai_compatible_chat_endpoint(monkeypatch):
